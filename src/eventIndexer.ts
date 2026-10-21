@@ -26,8 +26,10 @@
  */
 
 import { SorobanRpc, xdr as stellarXdr, scValToNative } from '@stellar/stellar-sdk';
-import { pool } from './db';
+import type { PoolClient } from 'pg';
+import { pool, saveCheckpoint } from './db';
 import { logger } from './logger';
+import { indexerLastProcessedLedger, indexerLedgerLag } from './metrics';
 import { publishLiveEvent } from './services/event-bus';
 
 // ---------------------------------------------------------------------------
@@ -299,30 +301,24 @@ export class EventIndexer {
         const events = response.events as unknown as RpcEvent[];
 
         if (events.length > 0) {
-          let persisted = 0;
-          let skipped = 0;
-
-          for (const raw of events) {
-            const record = this.parseRpcEvent(raw);
-            if (!record) {
-              skipped++;
-              continue;
-            }
-            const stored = await this.storeEvent(record);
-            if (stored) persisted++;
-            else skipped++;
-          }
-
-          // Advance cursor to the last event's pagingToken
           const last = events[events.length - 1];
+          const records = events
+            .map((raw) => this.parseRpcEvent(raw))
+            .filter((record): record is ContractEventRecord => record !== null);
+          const inserted = await this.storeBatch(
+            records,
+            last,
+            response.latestLedger,
+          );
+
           this.cursor = last.pagingToken ?? last.id;
 
           logger.info({
             message: 'Indexed event batch',
-            ledger: parseInt(events[events.length - 1].ledger, 10),
+            ledger: Number(last.ledger),
             total: events.length,
-            persisted,
-            skipped,
+            persisted: inserted.length,
+            skipped: events.length - inserted.length,
           });
         }
 
@@ -395,21 +391,57 @@ export class EventIndexer {
 
   // ── Persistence ──────────────────────────────────────────────────────────
 
-  /**
-   * Insert a contract event record.
-   *
-   * Uses (ledger_seq, tx_hash, event_index) as the deduplication key.
-   * Duplicate rows are silently skipped (ON CONFLICT DO NOTHING).
-   *
-   * This is safe to call after a full-history replay caused by cursor loss:
-   * the unique constraint added in migration 2_event_deduplication.js
-   * prevents duplicates at the database level regardless of how many times
-   * the same event is re-submitted (fixes issue #575).
-   *
-   * @returns true if a new row was inserted, false if it was a duplicate.
-   */
-  private async storeEvent(record: ContractEventRecord): Promise<boolean> {
-    const result = await pool.query(
+  private async storeBatch(
+    records: ContractEventRecord[],
+    lastEvent: RpcEvent,
+    latestLedger: number,
+  ): Promise<ContractEventRecord[]> {
+    const client = await pool.connect();
+    const inserted: ContractEventRecord[] = [];
+    const lastLedger = Number(lastEvent.ledger);
+
+    try {
+      await client.query('BEGIN');
+      for (const record of records) {
+        if (await this.insertEvent(record, client)) inserted.push(record);
+      }
+      await saveCheckpoint(CONTRACT_ID, lastLedger, lastEvent.txHash ?? null, client);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    indexerLastProcessedLedger.set(lastLedger);
+    indexerLedgerLag.set(Math.max(0, latestLedger - lastLedger));
+
+    for (const record of inserted) {
+      const liveType =
+        record.event_type === 'applied'
+          ? 'application_created'
+          : record.event_type === 'assigned'
+            ? 'assignment_created'
+            : 'cap_updated';
+      publishLiveEvent({
+        type: liveType,
+        data: {
+          eventType: record.event_type,
+          orgId: record.org_id,
+          issueId: record.issue_id,
+        },
+      });
+    }
+
+    return inserted;
+  }
+
+  private async insertEvent(
+    record: ContractEventRecord,
+    client: PoolClient,
+  ): Promise<boolean> {
+    const result = await client.query(
       `INSERT INTO contract_events
          (event_type, contributor, org_id, issue_id, tx_hash, event_index, ledger_seq, timestamp)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -425,29 +457,7 @@ export class EventIndexer {
         record.timestamp,
       ],
     );
-
-    const inserted = (result as { rowCount?: number }).rowCount === 1;
-
-    if (inserted) {
-      // Publish live update for real-time subscribers
-      const liveType =
-        record.event_type === 'applied'
-          ? 'application_created'
-          : record.event_type === 'assigned'
-            ? 'assignment_created'
-            : 'cap_updated';
-
-      publishLiveEvent({
-        type: liveType,
-        data: {
-          eventType: record.event_type,
-          orgId: record.org_id,
-          issueId: record.issue_id,
-        },
-      });
-    }
-
-    return inserted;
+    return (result as { rowCount?: number }).rowCount === 1;
   }
 }
 
