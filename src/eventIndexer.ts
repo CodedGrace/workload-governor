@@ -25,12 +25,15 @@
  *   from there, relying on the unique constraint to skip already-seen events.
  */
 
-import { SorobanRpc, xdr as stellarXdr, scValToNative } from '@stellar/stellar-sdk';
-import type { PoolClient } from 'pg';
+import { SorobanRpc } from '@stellar/stellar-sdk';
 import { pool, saveCheckpoint } from './db';
+import { parseRpcEvent } from './eventDecoder';
+import type { ContractEventRecord, RpcEvent } from './eventDecoder';
 import { logger } from './logger';
 import { indexerLastProcessedLedger, indexerLedgerLag } from './metrics';
 import { publishLiveEvent } from './services/event-bus';
+
+export type { ContractEventType, ContractEventRecord } from './eventDecoder';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -45,164 +48,6 @@ const RPC_URL =
 
 const POLL_INTERVAL_MS = 5_000;
 const ERROR_BACKOFF_MS = 10_000;
-
-// ---------------------------------------------------------------------------
-// Event types
-// ---------------------------------------------------------------------------
-
-export type ContractEventType =
-  | 'applied'
-  | 'withdrew'
-  | 'assigned'
-  | 'completed'
-  | 'revoked'
-  | 'maint_reg';
-
-/**
- * Normalized DB record for a single contract event.
- * Stored in the `contract_events` table.
- */
-export interface ContractEventRecord {
-  event_type: ContractEventType;
-  contributor: string | null;
-  org_id: string | null;
-  issue_id: number | null;
-  tx_hash: string;
-  event_index: number;
-  ledger: number;
-  timestamp: Date;
-}
-
-// ---------------------------------------------------------------------------
-// XDR helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Safely decode an XDR base64 string to its native JS value.
- * Returns null if decoding fails.
- */
-function decodeScVal(xdrBase64: string): unknown {
-  try {
-    const scVal = stellarXdr.ScVal.fromXDR(xdrBase64, 'base64');
-    return scValToNative(scVal);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Validate that topics[0] == "WG" (the contract namespace discriminant).
- * Returns false for any event that does not belong to WorkloadGovernor.
- * (#829 SC-004: structured 3-topic schema)
- */
-function isWorkloadGovernorEvent(topics: string[]): boolean {
-  if (topics.length < 3) return false;
-  const val = decodeScVal(topics[0]);
-  return val === 'WG';
-}
-
-/**
- * Extract the event type symbol from topics[1].
- * With the 3-topic schema: topics[0]="WG", topics[1]=event_name, topics[2]=entity.
- */
-function extractEventType(topics: string[]): ContractEventType | null {
-  if (topics.length < 3) return null;
-  const val = decodeScVal(topics[1]);
-  if (typeof val !== 'string') return null;
-  const known: ContractEventType[] = [
-    'applied',
-    'withdrew',
-    'assigned',
-    'completed',
-    'revoked',
-    'maint_reg',
-  ];
-  return known.includes(val as ContractEventType) ? (val as ContractEventType) : null;
-}
-
-/**
- * Extract the primary entity address from topics[2].
- * With the 3-topic schema the primary entity (contributor or admin) is always
- * in the third slot, making indexer topic-filter queries unambiguous.
- */
-function extractContributorFromTopic(topics: string[]): string | null {
-  if (topics.length < 3) return null;
-  const val = decodeScVal(topics[2]);
-  if (typeof val === 'string') return val;
-  return null;
-}
-
-/**
- * Parse the data value tuple emitted with each event.
- *
- * Event data layouts (from src/events.rs — 3-topic schema):
- *   applied    → data = (org_id: Symbol, issue_id: u32)
- *   withdrew   → data = (org_id: Symbol, issue_id: u32)
- *   assigned   → data = (maintainer: Address, org_id: Symbol, issue_id: u32)
- *   completed  → data = (maintainer: Address, org_id: Symbol, issue_id: u32)
- *   revoked    → data = (maintainer: Address, org_id: Symbol, issue_id: u32)
- *   maint_reg  → data = (admin: Address, org_id: Symbol)
- */
-interface ParsedData {
-  org_id: string | null;
-  issue_id: number | null;
-}
-
-function parseEventData(dataXdr: string, eventType: ContractEventType): ParsedData {
-  const raw = decodeScVal(dataXdr);
-
-  if (eventType === 'maint_reg') {
-    // data = (admin: Address, org_id: Symbol)
-    if (!Array.isArray(raw)) {
-      return { org_id: null, issue_id: null };
-    }
-    const [, orgId] = raw as [unknown, unknown];
-    return {
-      org_id: typeof orgId === 'string' ? orgId : null,
-      issue_id: null,
-    };
-  }
-
-  // All other events emit a tuple
-  if (!Array.isArray(raw)) {
-    return { org_id: null, issue_id: null };
-  }
-
-  if (eventType === 'applied' || eventType === 'withdrew') {
-    // (org_id, issue_id)
-    const [orgId, issueId] = raw as [unknown, unknown];
-    return {
-      org_id: typeof orgId === 'string' ? orgId : null,
-      issue_id: typeof issueId === 'number' ? issueId : null,
-    };
-  }
-
-  // assigned / completed / revoked → (maintainer, org_id, issue_id)
-  const [, orgId, issueId] = raw as [unknown, unknown, unknown];
-  return {
-    org_id: typeof orgId === 'string' ? orgId : null,
-    issue_id: typeof issueId === 'number' ? issueId : null,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// RPC event shape (SDK v11 / RPC spec)
-// ---------------------------------------------------------------------------
-
-interface RpcEvent {
-  /** "contract" | "system" | "diagnostic" */
-  type: string;
-  /** "<ledger>-<tx_index>-<event_index>" — paging cursor */
-  id: string;
-  pagingToken: string;
-  /** ledger sequence number as string */
-  ledger: string;
-  /** ISO-8601 creation timestamp */
-  createdAt: string;
-  txHash?: string;
-  topic: Array<{ type: string; xdr: string }>;
-  value: { type: string; xdr: string };
-}
 
 // ---------------------------------------------------------------------------
 // EventIndexer class
@@ -303,7 +148,7 @@ export class EventIndexer {
         if (events.length > 0) {
           const last = events[events.length - 1];
           const records = events
-            .map((raw) => this.parseRpcEvent(raw))
+            .map(parseRpcEvent)
             .filter((record): record is ContractEventRecord => record !== null);
           const inserted = await this.storeBatch(
             records,
@@ -333,62 +178,6 @@ export class EventIndexer {
     }
   }
 
-  // ── Event parsing ────────────────────────────────────────────────────────
-
-  /**
-   * Convert a raw RPC event object into a ContractEventRecord.
-   * Returns null if the event is unknown or malformed.
-   */
-  private parseRpcEvent(raw: RpcEvent): ContractEventRecord | null {
-    try {
-      // Only process contract events
-      if (raw.type !== 'contract') return null;
-
-      const topics = raw.topic?.map((t) => t.xdr) ?? [];
-      const dataXdr = raw.value?.xdr ?? '';
-
-      // #829 SC-004: reject events that do not carry the WG namespace discriminant
-      // in topics[0].  This prevents false positives from other contracts sharing
-      // the same RPC stream.
-      if (!isWorkloadGovernorEvent(topics)) return null;
-
-      const eventType = extractEventType(topics);
-      if (!eventType) return null;
-
-      // Primary entity is always topics[2] in the 3-topic schema.
-      // maintainer_registered events have an admin in topics[2] but no contributor.
-      const contributor =
-        eventType === 'maint_reg'
-          ? null
-          : extractContributorFromTopic(topics);
-
-      const { org_id, issue_id } = parseEventData(dataXdr, eventType);
-
-      // Parse the event index from the id string: "<ledger>-<tx_index>-<event_index>"
-      const idParts = raw.id.split('-');
-      const eventIndex = idParts.length >= 3 ? parseInt(idParts[2], 10) : 0;
-
-      // tx_hash may be undefined for some synthetic events; fall back to id
-      const txHash = raw.txHash ?? raw.id;
-
-      const ledger = parseInt(raw.ledger, 10);
-      const timestamp = new Date(raw.createdAt);
-
-      return {
-        event_type: eventType,
-        contributor,
-        org_id,
-        issue_id,
-        tx_hash: txHash,
-        event_index: eventIndex,
-        ledger,
-        timestamp,
-      };
-    } catch {
-      return null;
-    }
-  }
-
   // ── Persistence ──────────────────────────────────────────────────────────
 
   private async storeBatch(
@@ -397,13 +186,42 @@ export class EventIndexer {
     latestLedger: number,
   ): Promise<ContractEventRecord[]> {
     const client = await pool.connect();
-    const inserted: ContractEventRecord[] = [];
+    let inserted: ContractEventRecord[] = [];
     const lastLedger = Number(lastEvent.ledger);
 
     try {
       await client.query('BEGIN');
-      for (const record of records) {
-        if (await this.insertEvent(record, client)) inserted.push(record);
+      if (records.length > 0) {
+        const parameters: unknown[] = [];
+        const values = records.map((record, index) => {
+          const offset = index * 8;
+          parameters.push(
+            record.event_type,
+            record.contributor,
+            record.org_id,
+            record.issue_id,
+            record.tx_hash,
+            record.event_index,
+            record.ledger,
+            record.timestamp,
+          );
+          return `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, ` +
+            `$${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8})`;
+        });
+        const result = await client.query<{ tx_hash: string; event_index: number }>(
+          `INSERT INTO contract_events
+             (event_type, contributor, org_id, issue_id, tx_hash, event_index, ledger_seq, timestamp)
+           VALUES ${values.join(', ')}
+           ON CONFLICT (ledger_seq, tx_hash, event_index) DO NOTHING
+           RETURNING tx_hash, event_index`,
+          parameters,
+        );
+        const insertedKeys = new Set(
+          result.rows.map(({ tx_hash, event_index }) => JSON.stringify([tx_hash, event_index])),
+        );
+        inserted = records.filter((record) =>
+          insertedKeys.has(JSON.stringify([record.tx_hash, record.event_index])),
+        );
       }
       await saveCheckpoint(CONTRACT_ID, lastLedger, lastEvent.txHash ?? null, client);
       await client.query('COMMIT');
@@ -435,29 +253,6 @@ export class EventIndexer {
     }
 
     return inserted;
-  }
-
-  private async insertEvent(
-    record: ContractEventRecord,
-    client: PoolClient,
-  ): Promise<boolean> {
-    const result = await client.query(
-      `INSERT INTO contract_events
-         (event_type, contributor, org_id, issue_id, tx_hash, event_index, ledger_seq, timestamp)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (ledger_seq, tx_hash, event_index) DO NOTHING`,
-      [
-        record.event_type,
-        record.contributor,
-        record.org_id,
-        record.issue_id,
-        record.tx_hash,
-        record.event_index,
-        record.ledger,
-        record.timestamp,
-      ],
-    );
-    return (result as { rowCount?: number }).rowCount === 1;
   }
 }
 
